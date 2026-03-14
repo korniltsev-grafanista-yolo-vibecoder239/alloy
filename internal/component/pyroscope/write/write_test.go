@@ -12,7 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+
 	"connectrpc.com/connect"
+	"github.com/go-kit/log"
 	"github.com/grafana/alloy/internal/component/pyroscope"
 	pyrotestlogger "github.com/grafana/alloy/internal/component/pyroscope/util/testlog"
 	"github.com/grafana/alloy/syntax"
@@ -21,7 +25,9 @@ import (
 	typesv1 "github.com/grafana/pyroscope/api/gen/proto/go/types/v1"
 	"github.com/grafana/pyroscope/api/model/labelset"
 	"github.com/prometheus/client_golang/prometheus"
+	commonconfig "github.com/prometheus/common/config"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -686,4 +692,105 @@ func Test_Write_FanOut_ValidateLabels(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_newH2CClient_HTTPS_returns_base(t *testing.T) {
+	base := &http.Client{}
+	cfg := commonconfig.DefaultHTTPClientConfig
+	got := newH2CClient(log.NewNopLogger(), "https://example.com", base, cfg)
+	assert.Same(t, base, got, "HTTPS endpoint should return the base client unchanged")
+}
+
+func Test_newH2CClient_HTTP_returns_new_client(t *testing.T) {
+	base := &http.Client{}
+	cfg := commonconfig.DefaultHTTPClientConfig
+	got := newH2CClient(log.NewNopLogger(), "http://example.com", base, cfg)
+	assert.NotSame(t, base, got, "HTTP endpoint should return a new h2c client")
+}
+
+// newH2CTestServer creates a plain HTTP server that supports h2c (HTTP/2
+// cleartext) and returns the captured headers from the last request.
+func newH2CTestServer(t *testing.T, gotHeaders *http.Header) *httptest.Server {
+	t.Helper()
+	h2s := &http2.Server{}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*gotHeaders = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	})
+	ts := httptest.NewUnstartedServer(handler)
+	// Configure the test server to support h2c by adding HTTP/2 support
+	// and using the h2c handler wrapper.
+	require.NoError(t, http2.ConfigureServer(ts.Config, h2s))
+	ts.Config.Handler = h2c.NewHandler(handler, h2s)
+	ts.Start()
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func Test_newH2CRoundTripper_BasicAuth(t *testing.T) {
+	var gotHeaders http.Header
+	ts := newH2CTestServer(t, &gotHeaders)
+
+	cfg := commonconfig.HTTPClientConfig{
+		BasicAuth: &commonconfig.BasicAuth{
+			Username: "testuser",
+			Password: "testpass",
+		},
+	}
+	rt := newH2CRoundTripper(log.NewNopLogger(), cfg)
+
+	req, _ := http.NewRequest("GET", ts.URL, nil)
+	resp, err := rt.RoundTrip(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Contains(t, gotHeaders.Get("Authorization"), "Basic ", "h2c round-tripper should send Basic auth header")
+}
+
+func Test_newH2CRoundTripper_Authorization(t *testing.T) {
+	var gotHeaders http.Header
+	ts := newH2CTestServer(t, &gotHeaders)
+
+	cfg := commonconfig.HTTPClientConfig{
+		Authorization: &commonconfig.Authorization{
+			Type:        "Bearer",
+			Credentials: "my-token",
+		},
+	}
+	rt := newH2CRoundTripper(log.NewNopLogger(), cfg)
+
+	req, _ := http.NewRequest("GET", ts.URL, nil)
+	resp, err := rt.RoundTrip(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, "Bearer my-token", gotHeaders.Get("Authorization"), "h2c round-tripper should send Authorization header")
+}
+
+func Test_newH2CRoundTripper_BearerToken(t *testing.T) {
+	var gotHeaders http.Header
+	ts := newH2CTestServer(t, &gotHeaders)
+
+	cfg := commonconfig.HTTPClientConfig{
+		BearerToken: "bearer-secret",
+	}
+	rt := newH2CRoundTripper(log.NewNopLogger(), cfg)
+
+	req, _ := http.NewRequest("GET", ts.URL, nil)
+	resp, err := rt.RoundTrip(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, "Bearer bearer-secret", gotHeaders.Get("Authorization"), "h2c round-tripper should send Bearer token header")
+}
+
+func Test_newH2CRoundTripper_NoAuth(t *testing.T) {
+	var gotHeaders http.Header
+	ts := newH2CTestServer(t, &gotHeaders)
+
+	cfg := commonconfig.DefaultHTTPClientConfig
+	rt := newH2CRoundTripper(log.NewNopLogger(), cfg)
+
+	req, _ := http.NewRequest("GET", ts.URL, nil)
+	resp, err := rt.RoundTrip(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Empty(t, gotHeaders.Get("Authorization"), "h2c round-tripper without auth should not send Authorization header")
 }

@@ -270,7 +270,8 @@ func newFanOut(logger log.Logger, tracer trace.Tracer, config Arguments, metrics
 			endpoint.Headers = map[string]string{}
 		}
 		endpoint.Headers["X-Alloy-Id"] = uid
-		httpClient, err := commonconfig.NewClientFromConfig(*endpoint.HTTPClientConfig.Convert(), endpoint.Name)
+		promCfg := *endpoint.HTTPClientConfig.Convert()
+		httpClient, err := commonconfig.NewClientFromConfig(promCfg, endpoint.Name)
 		if err != nil {
 			return nil, err
 		}
@@ -286,7 +287,10 @@ func newFanOut(logger log.Logger, tracer trace.Tracer, config Arguments, metrics
 		// Bidi streaming (debuginfo upload) requires HTTP/2. For HTTPS this
 		// works via ALPN; for plain HTTP we need an h2c-capable transport
 		// because receive_http and pyroscope both serve h2c.
-		debuginfoHTTPClient := newH2CClient(endpoint.URL, httpClient)
+		debuginfoHTTPClient := newH2CClient(logger, endpoint.URL, httpClient, promCfg)
+		if debuginfoHTTPClient != httpClient {
+			configureTracing(config, debuginfoHTTPClient)
+		}
 		connectClient := debuginfov1alpha1connect.NewDebuginfoServiceClient(debuginfoHTTPClient, endpoint.URL)
 		debugInfo := debuginfo.NewClient(logger, connectClient, metrics.debugInfoUploadBytes, endpointDataPath)
 		debugInfos = append(debugInfos, debugInfo)
@@ -757,30 +761,84 @@ func validateLabels(lbls labels.Labels) error {
 
 // newH2CClient returns an HTTP client for Connect bidi streaming.
 // For HTTPS endpoints, the base client is returned as-is (HTTP/2 via ALPN).
-// For plain HTTP endpoints, returns a client with h2c transport because bidi
-// streaming requires HTTP/2 and both receive_http and pyroscope serve h2c.
+// For plain HTTP endpoints, returns a client with h2c transport wrapped in
+// the same auth/header decorators as the base client, because bidi streaming
+// requires HTTP/2 and both receive_http and pyroscope serve h2c.
 //
 // Note: the Go standard library and prometheus/common/config do not support
 // h2c natively (same pattern used in internal/service/cluster/cluster.go).
-// The h2c transport reuses the base client's settings where possible.
-func newH2CClient(endpointURL string, base *http.Client) *http.Client {
+func newH2CClient(logger log.Logger, endpointURL string, base *http.Client, cfg commonconfig.HTTPClientConfig) *http.Client {
 	u, err := url.Parse(endpointURL)
 	if err != nil || u.Scheme == "https" {
 		return base
 	}
 	return &http.Client{
-		Transport: &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-				// Plain TCP dial for h2c (same approach as cluster.go).
-				var d net.Dialer
-				return d.DialContext(ctx, network, addr)
-			},
-		},
+		Transport:     newH2CRoundTripper(logger, cfg),
 		Timeout:       base.Timeout,
 		CheckRedirect: base.CheckRedirect,
 		Jar:           base.Jar,
 	}
+}
+
+// newH2CRoundTripper builds an h2c (HTTP/2 cleartext) round-tripper wrapped
+// with the same auth and header decorators that prometheus/common/config
+// applies in NewRoundTripperFromConfig (http_config.go:673-730).
+//
+// OAuth2 is not supported because NewOAuth2RoundTripper requires a private
+// type; a warning is logged if OAuth2 is configured.
+func newH2CRoundTripper(logger log.Logger, cfg commonconfig.HTTPClientConfig) http.RoundTripper {
+	var rt http.RoundTripper = &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			// Plain TCP dial for h2c (same approach as cluster.go).
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+
+	// Wrap with auth/header decorators in the same order as
+	// NewRoundTripperFromConfig.
+	if cfg.Authorization != nil {
+		rt = commonconfig.NewAuthorizationCredentialsRoundTripper(
+			cfg.Authorization.Type,
+			secretReaderFor(cfg.Authorization.Credentials, cfg.Authorization.CredentialsFile),
+			rt,
+		)
+	}
+	// Backwards compatibility (same as prometheus/common/config).
+	if len(cfg.BearerToken) > 0 || len(cfg.BearerTokenFile) > 0 {
+		rt = commonconfig.NewAuthorizationCredentialsRoundTripper(
+			"Bearer",
+			secretReaderFor(cfg.BearerToken, cfg.BearerTokenFile),
+			rt,
+		)
+	}
+	if cfg.BasicAuth != nil {
+		rt = commonconfig.NewBasicAuthRoundTripper(
+			secretReaderFor(commonconfig.Secret(cfg.BasicAuth.Username), cfg.BasicAuth.UsernameFile),
+			secretReaderFor(cfg.BasicAuth.Password, cfg.BasicAuth.PasswordFile),
+			rt,
+		)
+	}
+	if cfg.OAuth2 != nil {
+		level.Warn(logger).Log("msg", "OAuth2 auth is not supported for h2c debuginfo upload; the debuginfo client will not authenticate with OAuth2")
+	}
+	if cfg.HTTPHeaders != nil {
+		rt = commonconfig.NewHeadersRoundTripper(cfg.HTTPHeaders, rt)
+	}
+
+	return rt
+}
+
+// secretReaderFor returns a SecretReader from an inline value or file path.
+func secretReaderFor(inline commonconfig.Secret, file string) commonconfig.SecretReader {
+	if len(inline) > 0 {
+		return commonconfig.NewInlineSecret(string(inline))
+	}
+	if file != "" {
+		return commonconfig.NewFileSecret(file)
+	}
+	return commonconfig.NewInlineSecret("")
 }
 
 func configureTracing(config Arguments, httpClient *http.Client) {
